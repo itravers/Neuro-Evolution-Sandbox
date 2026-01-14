@@ -2,7 +2,7 @@
 
 An experimental research sandbox for training and composing neural network based control policies inside a 2D physics driven world.
 
-This project explores how reusable low level control skills can be learned, evaluated, and combined using fast parallel simulation, clean control abstractions, and a mixture of experts architecture. The codebase is intentionally simple, explicit, and heavily commented, with an emphasis on clarity of mechanics rather than framework complexity.
+This project explores how reusable low level control skills can be learned, evaluated, and combined using fast parallel simulation, clean control abstractions, and a mixture of experts architecture.
 
 ---
 
@@ -62,8 +62,6 @@ It exists to explore:
 - How neural policies behave under clean, deterministic physics
 - How to scale training across many simulated environments
 
-The emphasis is on **control**, **composition**, and **emergence**, not visuals or content.
-
 ---
 
 ## Current State
@@ -113,9 +111,3 @@ Expect:
 Stability is secondary to understanding.
 
 ---
-
-## License
-
-MIT License
-
-Use, modify, and experiment freely.
