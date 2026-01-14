@@ -117,6 +117,7 @@ class KeyboardController(Controller):
             thrust += 1.0
         if keys[pygame.K_s]:
             thrust -= 1.0
+        fire = keys[pygame.K_SPACE]
 
         # Rotational control
         if keys[pygame.K_a]:
@@ -128,7 +129,7 @@ class KeyboardController(Controller):
         thrust = max(-1.0, min(1.0, thrust))
         turn = max(-1.0, min(1.0, turn))
 
-        return thrust, turn
+        return thrust, turn, fire
     
 
 # ===============================
@@ -148,12 +149,16 @@ class KeyboardController(Controller):
 # - The World does NOT know about pygame or input
 class World:
     def __init__(self, width, height):
+
         # World dimensions (in world units, currently pixels)
         self.width = width
         self.height = height
 
         # Entities contained in this world
         self.creatures = []
+
+        # Transient entities
+        self.projectiles = []
 
         # Control flags
         self.paused = False     # If True, world does not advance
@@ -166,6 +171,10 @@ class World:
         # - Worlds may contain many creatures later
         # - Allows centralized update and reset logic
         self.creatures.append(creature)
+
+    def add_projectile(self, projectile):
+        # Register a projectile with the world
+        self.projectiles.append(projectile)
 
     def update(self):
         # Advance the simulation by one timestep.
@@ -180,6 +189,16 @@ class World:
             creature.update()
             self.apply_wrapping(creature)
 
+         # Update projectiles
+        for projectile in self.projectiles:
+            projectile.update()
+            self.apply_wrapping(projectile)
+
+        # Remove expired projectiles
+        self.projectiles = [
+            p for p in self.projectiles if p.is_alive()
+        ]
+
     def apply_wrapping(self, creature):
         # Apply toroidal (wrap around) boundary conditions to a creature.
         #
@@ -188,6 +207,8 @@ class World:
         # - Different worlds may have different topology later
         # - Centralizing this logic enables multi world simulation
         pos = creature.pos
+
+        print("WRAP:", self.width, self.height)
 
         # Horizontal wrapping
         if pos[0] < 0:
@@ -218,6 +239,13 @@ class World:
 # Today it is keyboard input.
 # Later it will be a neural network.
 class Creature:
+    # ===============================
+    # Weapon Configuration
+    # ===============================
+
+    # Minimum time between shots (seconds)
+    FIRE_COOLDOWN_TIME = 0.2
+
     def __init__(self, start_pos, controller):
         # Position in world space
         self.pos = torch.tensor(start_pos, dtype=torch.float32)
@@ -229,8 +257,18 @@ class Creature:
         self.angle = torch.tensor(0.0)
         self.ang_vel = torch.tensor(0.0)
 
+        # Weapon state
+        self.fire_cooldown = 0.0
+
         # Controller responsible for deciding movement
         self.controller = controller
+
+        # Visual appearance
+        #
+        # Motivation:
+        # - Color is a property of the creature, not the renderer
+        # - Allows per-creature identity, teams, genome control later
+        self.color = (240, 240, 240)
 
         # ===============================
         # Geometry (Local Space)
@@ -246,22 +284,66 @@ class Creature:
         # Convention:
         # - Points are in local space
         # - Forward direction is +X
-        self.polygons = [
-            [
-                ( 8,  0),
-                (-8,  5),
-                (-8, -5),
-            ]
+        self.shapes = [
+            {
+                "type": "polygon",
+                "points": [
+                    ( 8,  0),
+                    (-8,  5),
+                    (-8, -5),
+                ]
+            }
         ]
+        
+
+    def try_fire(self, world):
+        # Attempt to fire a projectile if cooldown allows.
+        #
+        # Motivation:
+        # - Creature decides *intent*
+        # - World owns the projectile itself
+        if self.fire_cooldown > 0.0:
+            return
+
+        # Forward direction
+        forward = torch.tensor([
+            math.cos(self.angle),
+            math.sin(self.angle)
+        ])
+
+        # Spawn position slightly in front of creature
+        spawn_pos = self.pos + forward * 10.0
+
+        # Initial velocity (NO MAGIC NUMBERS HERE)
+        initial_vel = forward * Projectile.MAX_SPEED + self.vel
+
+        projectile = Projectile(
+            pos=spawn_pos,
+            vel=initial_vel
+        )
+
+        world.add_projectile(projectile)
+
+        # Reset creature-owned cooldown
+        self.fire_cooldown = Creature.FIRE_COOLDOWN_TIME
+
     
 
     # Update physics and control for one timestep
     def update(self):
         # Ask the controller what control inputs to apply
-        thrust, turn = self.controller.get_control(self)
+        thrust, turn, fire = self.controller.get_control(self)
 
-        # Apply control intent to physics
+         # Apply throttle and turning inputs
         self.apply_control(thrust, turn)
+
+        # Fire weapon if requested
+        if fire:
+            self.try_fire(world)
+
+        # Decrease fire cooldown over time
+        if self.fire_cooldown > 0.0:
+            self.fire_cooldown -= DT
 
         # Advance the physics simulation
         self.physics_step()
@@ -310,6 +392,65 @@ class Creature:
         self.angle += self.ang_vel * DT
 
 
+# ===============================
+# Projectile Class
+# ===============================
+
+# A projectile is a lightweight physics object fired by a creature.
+#
+# Motivation:
+# - Projectiles are transient entities
+# - They should be simulated by the world, not the creature
+# - Later they can support collisions, damage, sensors, etc.
+class Projectile:
+    # ===============================
+    # Projectile Configuration
+    # ===============================
+
+    MAX_SPEED = 300.0
+
+    def __init__(self, pos, vel, lifetime=2.0):
+        # Position in world space
+        self.pos = pos.clone()
+
+        # Clamp velocity to projectile max speed
+        speed = torch.linalg.norm(vel)
+        if speed > Projectile.MAX_SPEED:
+            vel = vel / speed * Projectile.MAX_SPEED
+
+        # Store velocity
+        self.vel = vel
+
+        # Store speed explicitly (owned by projectile)
+        self.speed = torch.linalg.norm(self.vel)
+
+        # Orientation derived from velocity
+        if self.speed > 0:
+            self.angle = torch.tensor(
+                math.atan2(self.vel[1], self.vel[0])
+            )
+        else:
+            self.angle = torch.tensor(0.0)
+
+        # Lifetime
+        self.lifetime = lifetime
+
+        # Visuals
+        self.color = (255, 80, 80)
+        self.shapes = [
+            {
+                "type": "circle",
+                "radius": 3.0
+            }
+        ]
+
+    def update(self):
+        # Advance projectile physics
+        self.pos += self.vel * DT
+        self.lifetime -= DT
+
+    def is_alive(self):
+        return self.lifetime > 0.0
 
 # ===============================
 # World Renderer
@@ -327,6 +468,7 @@ class Creature:
 # - Renderer does NOT modify simulation state
 class WorldRenderer:
     def __init__(self, surface):
+
         # Surface to draw onto (pygame surface)
         self.surface = surface
 
@@ -334,40 +476,68 @@ class WorldRenderer:
         # Clear background
         self.surface.fill((20, 20, 20))
 
-        # Draw all creatures in the world
+        # Draw all creatures
         for creature in world.creatures:
-            self.draw_creature(creature)
+            self.draw_entity(creature, color=(240, 240, 240))
 
-    def draw_creature(self, creature):
-        # Draw all polygons that make up the creature.
+        # Draw all projectiles
+        for projectile in world.projectiles:
+            self.draw_entity(projectile, color=(255, 80, 80))
+
+    def draw_entity(self, entity, color):
+        # Draw all shapes that make up an entity.
         #
-        # Motivation:
-        # - Renderer does not assume creature shape
-        # - Supports multi polygon bodies
-        # - Supports genome defined geometry later
+        # Expected entity interface:
+        # - entity.pos    : torch tensor (x, y)
+        # - entity.angle  : float (radians)
+        # - entity.shapes : list of shape descriptors
 
-        angle = creature.angle
-        pos = creature.pos
+        ex = float(entity.pos[0])
+        ey = float(entity.pos[1])
 
-        cos_a = math.cos(angle)
-        sin_a = math.sin(angle)
+        cos_a = math.cos(entity.angle)
+        sin_a = math.sin(entity.angle)
 
-        for polygon in creature.polygons:
-            transformed = []
+        for shape in entity.shapes:
+            shape_type = shape["type"]
 
-            for x, y in polygon:
-                # Rotate from local space into world space
-                rx = x * cos_a - y * sin_a
-                ry = x * sin_a + y * cos_a
+            # -------------------------------
+            # Polygon shape
+            # -------------------------------
+            if shape_type == "polygon":
+                transformed = []
 
-                # Translate into world position
-                sx = int(pos[0] + rx)
-                sy = int(pos[1] + ry)
+                for x, y in shape["points"]:
+                    # Rotate from local to world space
+                    rx = x * cos_a - y * sin_a
+                    ry = x * sin_a + y * cos_a
 
-                transformed.append((sx, sy))
+                    # Translate to world position
+                    sx = int(ex + rx)
+                    sy = int(ey + ry)
 
-            pygame.draw.polygon(self.surface, (240, 240, 240), transformed)
+                    transformed.append((sx, sy))
 
+                pygame.draw.polygon(self.surface, color, transformed)
+
+            # -------------------------------
+            # Circle shape
+            # -------------------------------
+            elif shape_type == "circle":
+                radius = shape["radius"]
+
+                pygame.draw.circle(
+                    self.surface,
+                    color,
+                    (int(ex), int(ey)),
+                    int(radius)
+                )
+
+            # -------------------------------
+            # Unknown shape
+            # -------------------------------
+            else:
+                raise ValueError(f"Unknown shape type: {shape_type}")
 
 
 
@@ -404,7 +574,7 @@ def get_keyboard_control():
 def checkEvents():
     global running, screen, WORLD_WIDTH, WORLD_HEIGHT
 
-    world = World(WORLD_WIDTH, WORLD_HEIGHT)
+    #world = World(WORLD_WIDTH, WORLD_HEIGHT)
 
     for event in pygame.event.get():
         if event.type == pygame.QUIT:
@@ -433,7 +603,7 @@ def checkEvents():
 def main():
     global WORLD_WIDTH, WORLD_HEIGHT, world, renderer
 
-    world = World(WORLD_WIDTH, WORLD_HEIGHT)
+    
 
 
     # Initialize pygame and window
@@ -443,9 +613,14 @@ def main():
         pygame.RESIZABLE
     )
 
+    
+
     # Query actual screen size from pygame
     WORLD_WIDTH, WORLD_HEIGHT = screen.get_size()
     pygame.display.set_caption("PyTorch Physics Creature Demo")
+
+    # Create the world
+    world = World(WORLD_WIDTH, WORLD_HEIGHT)
 
     # Create clock for fixed timestep
     clock = pygame.time.Clock()
