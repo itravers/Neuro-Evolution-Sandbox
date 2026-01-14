@@ -42,6 +42,8 @@ SCREEN_HEIGHT = 600
 # ===============================
 
 running = True
+world = None   # declaration
+renderer = None  # declaration
 
 # ===============================
 # World Configuration
@@ -127,6 +129,78 @@ class KeyboardController(Controller):
         turn = max(-1.0, min(1.0, turn))
 
         return thrust, turn
+    
+
+# ===============================
+# World Class
+# ===============================
+
+# The World represents an independent simulation environment.
+#
+# Motivation:
+# - We want to run many worlds simultaneously in the future
+# - Each world may have different sizes, entities, and rules
+# - Worlds must be updatable without rendering (headless training)
+#
+# Design principle:
+# - The World owns spatial rules (bounds, wrapping)
+# - The World owns collections of entities
+# - The World does NOT know about pygame or input
+class World:
+    def __init__(self, width, height):
+        # World dimensions (in world units, currently pixels)
+        self.width = width
+        self.height = height
+
+        # Entities contained in this world
+        self.creatures = []
+
+        # Control flags
+        self.paused = False     # If True, world does not advance
+        self.visible = True    # If False, world is not rendered
+
+    def add_creature(self, creature):
+        # Register a creature with this world.
+        #
+        # Motivation:
+        # - Worlds may contain many creatures later
+        # - Allows centralized update and reset logic
+        self.creatures.append(creature)
+
+    def update(self):
+        # Advance the simulation by one timestep.
+        #
+        # Motivation:
+        # - This becomes the core "step()" function used during training
+        # - Allows worlds to be paused, stepped independently, or batched
+        if self.paused:
+            return
+
+        for creature in self.creatures:
+            creature.update()
+            self.apply_wrapping(creature)
+
+    def apply_wrapping(self, creature):
+        # Apply toroidal (wrap around) boundary conditions to a creature.
+        #
+        # Motivation:
+        # - Boundary rules are properties of the world, not the creature
+        # - Different worlds may have different topology later
+        # - Centralizing this logic enables multi world simulation
+        pos = creature.pos
+
+        # Horizontal wrapping
+        if pos[0] < 0:
+            pos[0] += self.width
+        elif pos[0] >= self.width:
+            pos[0] -= self.width
+
+        # Vertical wrapping
+        if pos[1] < 0:
+            pos[1] += self.height
+        elif pos[1] >= self.height:
+            pos[1] -= self.height
+
 
 
 # ===============================
@@ -157,6 +231,28 @@ class Creature:
 
         # Controller responsible for deciding movement
         self.controller = controller
+
+        # ===============================
+        # Geometry (Local Space)
+        # ===============================
+
+        # List of polygons that define the creature's body.
+        #
+        # Motivation:
+        # - Creatures may be composed of multiple shapes later
+        # - Shapes may be decided by a genome
+        # - Renderer should not invent geometry
+        #
+        # Convention:
+        # - Points are in local space
+        # - Forward direction is +X
+        self.polygons = [
+            [
+                ( 8,  0),
+                (-8,  5),
+                (-8, -5),
+            ]
+        ]
     
 
     # Update physics and control for one timestep
@@ -213,52 +309,66 @@ class Creature:
         # Integrate angular velocity into orientation
         self.angle += self.ang_vel * DT
 
-        # Wrap world position horizontally
-        if self.pos[0] < 0:
-            self.pos[0] += WORLD_WIDTH
-        elif self.pos[0] >= WORLD_WIDTH:
-            self.pos[0] -= WORLD_WIDTH
-
-        # Wrap world position vertically
-        if self.pos[1] < 0:
-            self.pos[1] += WORLD_HEIGHT
-        elif self.pos[1] >= WORLD_HEIGHT:
-            self.pos[1] -= WORLD_HEIGHT
 
 
-    # Draw the creature on the given surface
-    def draw(self, surface):
-        # Draw the creature as a triangle pointing in its forward direction.
+# ===============================
+# World Renderer
+# ===============================
+
+# The WorldRenderer is responsible for drawing a World to a surface.
+#
+# Motivation:
+# - Allows worlds to be simulated without rendering (headless training)
+# - Allows multiple worlds to be drawn differently
+# - Allows overlaying multiple worlds in one window
+#
+# Design principle:
+# - Renderer observes world state
+# - Renderer does NOT modify simulation state
+class WorldRenderer:
+    def __init__(self, surface):
+        # Surface to draw onto (pygame surface)
+        self.surface = surface
+
+    def draw(self, world):
+        # Clear background
+        self.surface.fill((20, 20, 20))
+
+        # Draw all creatures in the world
+        for creature in world.creatures:
+            self.draw_creature(creature)
+
+    def draw_creature(self, creature):
+        # Draw all polygons that make up the creature.
         #
-        # Rendering is intentionally simple and separate from physics.
+        # Motivation:
+        # - Renderer does not assume creature shape
+        # - Supports multi polygon bodies
+        # - Supports genome defined geometry later
 
-        # Triangle geometry in local space
-        size = 8
+        angle = creature.angle
+        pos = creature.pos
 
-        # Triangle points (pointing right initially)
-        points = [
-            ( size,  0),
-            (-size,  size * 0.6),
-            (-size, -size * 0.6),
-        ]
+        cos_a = math.cos(angle)
+        sin_a = math.sin(angle)
 
-        # Rotate and translate triangle into world/screen space
-        transformed = []
+        for polygon in creature.polygons:
+            transformed = []
 
-        # Precompute sine/cosine for rotation
-        for x, y in points:
-            rx = x * math.cos(self.angle) - y * math.sin(self.angle)
-            ry = x * math.sin(self.angle) + y * math.cos(self.angle)
+            for x, y in polygon:
+                # Rotate from local space into world space
+                rx = x * cos_a - y * sin_a
+                ry = x * sin_a + y * cos_a
 
-            # Translate to world position
-            sx = int(self.pos[0] + rx)
-            sy = int(self.pos[1] + ry)
+                # Translate into world position
+                sx = int(pos[0] + rx)
+                sy = int(pos[1] + ry)
 
-            # Collect transformed point
-            transformed.append((sx, sy))
+                transformed.append((sx, sy))
 
-        # Draw filled triangle
-        pygame.draw.polygon(surface, (240, 240, 240), transformed)
+            pygame.draw.polygon(self.surface, (240, 240, 240), transformed)
+
+
 
 
 # ===============================
@@ -294,6 +404,8 @@ def get_keyboard_control():
 def checkEvents():
     global running, screen, WORLD_WIDTH, WORLD_HEIGHT
 
+    world = World(WORLD_WIDTH, WORLD_HEIGHT)
+
     for event in pygame.event.get():
         if event.type == pygame.QUIT:
             running = False
@@ -305,6 +417,13 @@ def checkEvents():
             )
             WORLD_WIDTH, WORLD_HEIGHT = screen.get_size()
 
+            # Update world dimensions to match window
+            world.width = WORLD_WIDTH
+            world.height = WORLD_HEIGHT
+
+            # Update renderer surface
+            renderer.surface = screen
+
 
 # ===============================
 # Main Game Loop
@@ -312,7 +431,10 @@ def checkEvents():
 
 # Main entry point for the simulation
 def main():
-    global WORLD_WIDTH, WORLD_HEIGHT
+    global WORLD_WIDTH, WORLD_HEIGHT, world, renderer
+
+    world = World(WORLD_WIDTH, WORLD_HEIGHT)
+
 
     # Initialize pygame and window
     pygame.init()
@@ -328,11 +450,17 @@ def main():
     # Create clock for fixed timestep
     clock = pygame.time.Clock()
 
+    # Create world renderer
+    renderer = WorldRenderer(screen)
+
     # Create a keyboard-based controller
     controller = KeyboardController()
 
     # Create a single creature at the center of the screen
     creature = Creature(start_pos=(WORLD_WIDTH / 2, WORLD_HEIGHT / 2), controller=controller)
+
+
+    world.add_creature(creature)
 
     # Main loop
     while running:
@@ -342,20 +470,16 @@ def main():
         # Handle input events
         checkEvents()
 
-        # Update creature physics and controls
-        creature.update()
+        # Update world
+        world.update()
 
-        # Clear screen
-        screen.fill((20, 20, 20))
+        # Render world
+        renderer.draw(world)
 
-        # Draw creature
-        creature.draw(screen)
-
-        # Present frame
+        # Update display
         pygame.display.flip()
 
         
-
     # Clean up and exit
     pygame.quit()
 
